@@ -1,96 +1,218 @@
-/* -*- Mode:C++; c-file-style:"gnu"; indent-tabs-mode:nil; -*- */
-/**
- * Copyright (c) 2011-2015  Regents of the University of California.
- *
- * This file is part of ndnSIM. See AUTHORS for complete list of ndnSIM authors and
- * contributors.
- *
- * ndnSIM is free software: you can redistribute it and/or modify it under the terms
- * of the GNU General Public License as published by the Free Software Foundation,
- * either version 3 of the License, or (at your option) any later version.
- *
- * ndnSIM is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
- * without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
- * PURPOSE.  See the GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along with
- * ndnSIM, e.g., in COPYING.md file.  If not, see <http://www.gnu.org/licenses/>.
- **/
-
-// ndn-custom-apps.cpp
-
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <iomanip>
+#include <time.h>
+#include <cstdio>
 #include "ns3/core-module.h"
 #include "ns3/network-module.h"
 #include "ns3/ndnSIM-module.h"
+#include "ns3/socket.h"
 #include "ns3/point-to-point-module.h"
+#include "ns3/netanim-module.h"
+#include "ns3/internet-module.h"
 #include "ns3/applications-module.h"
 #include "ns3/tcp-header.h"
 #include "ns3/udp-header.h"
-#define     NET_MASK   "255.255.255.0"
-#define     NET_ADDR   "192.168.1.0"
-#define     FIRST_NO     "0.0.0.1"
-#define     PORT             50000
+
+#define TOTAL_NODE 13
+//ノードの総数
+#define ROUTER1_NUM 10
+//ルータ１のノードID
+#define ROUTER2_NUM 11
+//rルータ２のノードID
+#define SERVER_NUM 12
+//サーバのノードID
+
+// define -----
+double MIN_TIME = 1.0;
+double SENDING_RATE = 40.0; 
+double SIMULATION_TIME = 60.0;
+
+//ns3の名前空間の設定
 namespace ns3 {
 
-/**
- * This scenario simulates a one-node two-custom-app scenario:
- *
- *   +------+ <-----> (CustomApp)
- *   | Node |
- *   +------+ <-----> (Hijacker)
- *
- *     NS_LOG=CustomApp ./waf --run=ndn-custom-apps
- */
+
 int
 main(int argc, char* argv[])
 {
-  Config::SetDefault("ns3::PointToPointNetDevice::DataRate", StringValue("1Mbps"));
-  Config::SetDefault("ns3::PointToPointChannel::Delay", StringValue("10ms"));
-  Config::SetDefault("ns3::QueueBase::MaxPackets", UintegerValue(20));
-  // Read optional command-line parameters (e.g., enable visualizer with ./waf --run=<> --visualize
+  // time_t now = std::time(nullptr);
+  // char Anim[60];
+  // int n1 = sprintf(Anim,"./Result/Anim/AnimFile_%s.csv",ctime(&now));
+  //アニメーションファイルの名前
+  // std::string animFile = Anim;
+  
   CommandLine cmd;
   cmd.Parse(argc, argv);
 
-  // Creating nodes
-  //Ptr<Node> node = CreateObject<Node>();
+  //ノードの作成
   NodeContainer nodes;
-  nodes.Create(2);
-
+  nodes.Create(TOTAL_NODE);
+  
+  //p2p ノードを繋げる
   PointToPointHelper p2p;
-  p2p.Install(nodes.Get(0),nodes.Get(1));
-  // Install NDN stack on all nodes
+  p2p.SetDeviceAttribute ("DataRate", StringValue ("5Mbps"));
+  p2p.SetChannelAttribute ("Delay", StringValue ("2ms"));
+  for(int i = 0; i < TOTAL_NODE; i++){
+    if((i!= ROUTER1_NUM)&&(i!=ROUTER2_NUM)&&(i!=SERVER_NUM))
+    {
+      p2p.Install(nodes.Get(i),nodes.Get(ROUTER1_NUM));
+    }
+  }
+  p2p.Install(nodes.Get(ROUTER1_NUM), nodes.Get(ROUTER2_NUM));
+  p2p.Install(nodes.Get(ROUTER2_NUM), nodes.Get(SERVER_NUM));
+  
+  //サーバーとユーザにndnとして必要な機能を追加
   ndn::StackHelper ndnHelper;
   ndnHelper.SetDefaultRoutes(true);
-  ndnHelper.InstallAll();
-
+  ndnHelper.SetOldContentStore("ns3::ndn::cs::Nocache");
+  NodeContainer UserAndServerNodes;
+  for(NodeList::Iterator i=NodeList::Begin();i!=NodeList::End();++i){
+    if(*i!=nodes.Get(ROUTER1_NUM)){
+      if(*i!=nodes.Get(ROUTER2_NUM)){
+      UserAndServerNodes.Add(*i);
+      }
+    }
+  }
+  
+  ndnHelper.Install(UserAndServerNodes);
+  
+  //ルータにndnとして必要な機能を追加 
+  ndn::StackHelper ndnHelper2;
+  ndnHelper2.setCsSize(1000);
+  ndnHelper2.setPolicy("nfd::cs::slru");
+  ndnHelper2.Install(nodes.Get(ROUTER1_NUM));
+  
+  ndn::StackHelper ndnHelper3;
+  ndnHelper3.setCsSize(1000);
+  ndnHelper3.setPolicy("nfd::cs::slruNoPrint");
+  ndnHelper3.Install(nodes.Get(ROUTER2_NUM));
+  
+  //要求パケットがどのようにルートを探索するかを設定
+  ndn::StrategyChoiceHelper::InstallAll
+    ("/", "/localhost/nfd/strategy/best-route");
+  
+  //全てのノードにndnのルーティングの機能を追加
   ndn::GlobalRoutingHelper ndnGlobalRoutingHelper;
   ndnGlobalRoutingHelper.InstallAll();
-
-  TypeId tid = TypeId::LookupByName ("ns3::UdpSocketFactory");
-
-  // App1
-  ndn::AppHelper app1("CustomApp");
-  app1.Install(nodes.Get(0));
- // std::cout << node->GetObject<ndn::ContentStore>() <<std::endl;
-  // App2
-  // ndn::AppHelper app2("CustomApp1");
-  // app2.Install(nodes.Get(1)); // last node
+   
+  //ユーザ攻撃あり 
+  ndn::AppHelper user1("CustomConsumer");
+  //ユーザの挙動を書いたオブジェクトを作成
+  user1.SetPrefix("/prefix");
+  //要求したいデータの名前を設定
+  user1.SetAttribute("Frequency",StringValue("300"));
+  //要求する頻度を設定
+  NodeContainer UserNodes_Verification;
+  for(NodeList::Iterator i=NodeList::Begin();i!=NodeList::End();++i){
+    if(*i!=nodes.Get(ROUTER1_NUM)&&*i!=nodes.Get(ROUTER2_NUM)
+        &&*i!=nodes.Get(SERVER_NUM)){
+      UserNodes_Verification.Add(*i);
+    }
+  }
+  user1.Install(UserNodes_Verification);
   
-  ndn::AppHelper app2("CustomApp");
-  app2.Install(nodes.Get(1)); // last node
+  //遅延を測るためのノード
+  // ndn::AppHelper user2("CustomConsumer1");
+  // user2.SetPrefix("/prefix/sub");
+  // // user2.SetAttribute("Frequency"
+  // // ,StringValue( std::to_string( SENDING_RATE ) ));
+  // user2.SetAttribute("Frequency",StringValue("2"));
+  // user2.Install(nodes.Get(0));
+ 
+  //ユーザ攻撃なし 
+  // ndn::AppHelper user3("CustomConsumer2");
+  //ユーザの挙動を書いたオブジェクトを作成
+  // user3.SetPrefix("/prefix");
+  //要求したいデータの名前を設定
+  //user3.SetAttribute("Frequency"
+  //,StringValue( std::to_string( SENDING_RATE ) ));
+  // user3.SetAttribute("Frequency",StringValue("300"));
+  //要求する頻度を設定
+  // NodeContainer UserNodes;
+  // for(NodeList::Iterator i=NodeList::Begin();i!=NodeList::End();++i){
+    // if(*i!=nodes.Get(ROUTER1_NUM)&&*i!=nodes.Get(ROUTER2_NUM)
+        // &&*i!=nodes.Get(SERVER_NUM)
+        // &&*i!=nodes.Get(ATTACKER1_NUM)&&*i!=nodes.Get(ATTACKER2_NUM)){
+      // UserNodes.Add(*i);
+    // }
+  // }
+  // user3.Install(UserNodes);
   
-  ndnGlobalRoutingHelper.AddOrigins("/prefix/sub",nodes.Get(1));
+  // NodeContainer UserNodes;
+  // int j1 = 0;
+  // for(NodeList::Iterator i=NodeList::Begin();i!=NodeList::End();++i){
+    // if(*i!=nodes.Get(ROUTER1_NUM)&&*i!=nodes.Get(ROUTER2_NUM)
+        // &&*i!=nodes.Get(SERVER_NUM)){
+      // if(ATTACK_TOTAL<=j1){
+        // UserNodes.Add(*i);
+      // }
+    // }
+    // j1++;
+  // }
+  // user3.Install(UserNodes);
+  //ルータ1
+  ndn::AppHelper router1("CustomRouter2");
+  //ルータのオブジェクト生成
+  router1.Install(nodes.Get(ROUTER1_NUM));
+  //ルータ配置
+
+  //ルータ２
+  ndn::AppHelper router2("CustomRouter2");
+  //ルータのオブジェクト生成
+  router2.Install(nodes.Get(ROUTER2_NUM));
+  //ルータ配置
+  
+  // サーバ
+  ndn::AppHelper server("CustomProducer");
+  //サーバのオブジェクト生成
+  // serverHelper.SetAttribute("PayloadSize",StringValue("1024"));
+  server.Install(nodes.Get(SERVER_NUM)); // サーバ配置
+  
+  //NDNにおけるルーティング処理を作成
+  ndnGlobalRoutingHelper.AddOrigins("/prefix",nodes.Get(SERVER_NUM));
+  ndnGlobalRoutingHelper.AddOrigins("/prefix/sub",nodes.Get(SERVER_NUM));
+  ndnGlobalRoutingHelper.AddOrigins("/verification/0",nodes.Get(SERVER_NUM));
+  ndnGlobalRoutingHelper.AddOrigins("/verification/1",nodes.Get(SERVER_NUM));
+  ndnGlobalRoutingHelper.AddOrigins("/verification/2",nodes.Get(SERVER_NUM));
+  ndnGlobalRoutingHelper.AddOrigins("/verification/3",nodes.Get(SERVER_NUM));
+  ndnGlobalRoutingHelper.AddOrigins("/verification/4",nodes.Get(SERVER_NUM));
+  ndnGlobalRoutingHelper.AddOrigins("/verification/5",nodes.Get(SERVER_NUM));
+  ndnGlobalRoutingHelper.AddOrigins("/verification/6",nodes.Get(SERVER_NUM));
+  ndnGlobalRoutingHelper.AddOrigins("/verification/7",nodes.Get(SERVER_NUM));
+  ndnGlobalRoutingHelper.AddOrigins("/verification/8",nodes.Get(SERVER_NUM));
+  ndnGlobalRoutingHelper.AddOrigins("/verification/9",nodes.Get(SERVER_NUM));
   ndn::GlobalRoutingHelper::CalculateRoutes();
-
-  Simulator::Stop(Seconds(20.0));
-
+  
+  //指定した秒数後にシミュレーション終了
+  Simulator::Stop(Seconds(SIMULATION_TIME));
+  // Simulator::Stop(Seconds(40.0 ));
+  
+  //NetAnimのファイル作成
+  // AnimationInterface anim (animFile);
+  //GUI表示のファイル作成
+  // anim.EnablePacketMetadata ();
+  //GUI表示のファイル作成
+  // anim.SetConstantPosition(nodes.Get(0),0,78);
+  // anim.SetConstantPosition(nodes.Get(1),35,35);
+  // anim.SetConstantPosition(nodes.Get(2),35,0);
+  // anim.SetConstantPosition(nodes.Get(3),71,78);
+  
+  //シミュレータを実行
   Simulator::Run();
+  
+  //アニメーションファイル作成完了を出力
+  // std::cout << "Animation Trace file created:" 
+    // << animFile.c_str()<< std::endl;
+  
+  //シミュレータを破壊
   Simulator::Destroy();
 
   return 0;
 }
 
-} // namespace ns3
+//ns3の名前空間の終了
+}
 
 int
 main(int argc, char* argv[])
